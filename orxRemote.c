@@ -55,7 +55,7 @@ orxSTATUS orxFASTCALL orxRemote_Init();
 typedef struct __WebArchive_t
 {
   orxS64  s64Size, s64Cursor;
-  orxU8  *pu8Buffer;
+  orxU8  *zLocation;
 } WebArchive;
 
 typedef enum __orxREMOTE_QUERY_TYPE_t
@@ -76,10 +76,13 @@ static orxTHREAD_SEMAPHORE *spstSemaphore;
 static orxU32 orxRemote_GetHash(const orxSTRING _zHost, orxU32 _u32Port)
 {
   orxU32 u32Result;
+  orxCHAR p[32] = { 0 };
+
+  orxString_NPrint(p, 31, "%d", _u32Port);
 
   // Updates result
   u32Result = orxString_ToCRC(_zHost);
-  u32Result = orxString_NContinueCRC((orxSTRING)&_u32Port, u32Result, sizeof(orxU32));
+  u32Result = orxString_NContinueCRC(p, u32Result, sizeof(orxU32));
 
   // Done!
   return u32Result;
@@ -211,7 +214,7 @@ static orxS64 orxFASTCALL orxRemote_ExecuteQuery(const orxSTRING _zHost, orxU32 
   if(stSocket > 0)
   {
     // Prints query header
-    orxString_NPrint(acBuffer, sizeof(acBuffer) - 1, "%s /%s HTTP/1.1\r\nHost: %s:%u\r\nConnection: keep-alive\r\nUser-Agent: orxRemoteClient/1.0 (+http://orx-project.org)\r\n\r\n", (_eType == orxREMOTE_QUERY_TYPE_TIME) ? "HEAD" : "GET", _zResource, _zHost, _u32Port);
+    orxString_NPrint(acBuffer, sizeof(acBuffer) - 1, "%s /%s HTTP/1.1\r\nHost: %s:%u\r\nConnection: keep-alive\r\nUser-Agent: orxRemoteClient/1.0 (+http://orx-project.org)\r\n\r\n", (_eType == orxREMOTE_QUERY_TYPE_TIME || _ppu8Buffer == orxNULL) ? "HEAD" : "GET", _zResource, _zHost, _u32Port);
 
     // Gets its length
     s32Length = (orxS32)orxString_GetLength(acBuffer);
@@ -359,6 +362,144 @@ static orxS64 orxFASTCALL orxRemote_ExecuteQuery(const orxSTRING _zHost, orxU32 
   return s64Result;
 }
 
+static orxS64 orxFASTCALL orxRemote_ExecuteRange(const orxSTRING _zHost, orxU32 _u32Port, const orxSTRING _zResource, orxS64 start, orxS64 count, orxU8* _pu8Buffer)
+{
+	orxCHAR acBuffer[4096] = { 0 };
+	orxS32  s32Length;
+	Socket  stSocket;
+	orxBOOL bClose = orxFALSE;
+	orxS64  s64Result = 0;
+
+	// Waits for semaphore
+	orxThread_WaitSemaphore(spstSemaphore);
+
+	// Connects to host
+	stSocket = orxRemote_Connect(_zHost, _u32Port);
+
+	// Success?
+	if (stSocket > 0)
+	{
+		// Prints query header
+		orxString_NPrint(acBuffer, sizeof(acBuffer) - 1, "GET /%s HTTP/1.1\r\nHost: %s:%u\r\nConnection: keep-alive\r\nUser-Agent: orxRemoteClient/1.0 (+http://orx-project.org)\r\nrange: bytes=%d-%d\r\n\r\n", _zResource, _zHost, _u32Port, start, count);
+
+		// Gets its length
+		s32Length = (orxS32)orxString_GetLength(acBuffer);
+
+		// Sends it
+		if (send(stSocket, acBuffer, s32Length, 0) == s32Length)
+		{
+			// Gets answer's header
+			if ((s32Length = recv(stSocket, acBuffer, sizeof(acBuffer) - 1, 0)) > 0)
+			{
+				orxU32 u32ReturnCode;
+
+				// Success?
+				if ((orxString_Scan(acBuffer, "HTTP/1.%*d %03u", (unsigned int*)&u32ReturnCode) == 1) && (u32ReturnCode == 206))
+				{
+					const orxCHAR* pc, * pcContentStart = orxNULL;
+					orxS32          s32ContentStartLength = 0;
+
+					// Looks for end of header
+					if ((pc = orxString_SearchString(acBuffer, "\r\n\r\n")) != orxNULL)
+					{
+						orxS32 s32HeaderLength;
+
+						// Gets real header length
+						s32HeaderLength = pc + 4 - acBuffer;
+
+						// Has content started?
+						if (s32Length != s32HeaderLength)
+						{
+							// Stores content start
+							pcContentStart = pc + 4;
+
+							// Stores content start length
+							s32ContentStartLength = s32Length - s32HeaderLength;
+
+							// Adjusts header length
+							s32Length = s32HeaderLength;
+						}
+					}
+
+					// Looks for content length
+					if (((pc = orxString_SearchString(acBuffer, "Content-Length:")) != orxNULL)
+						|| ((pc = orxString_SearchString(acBuffer, "content-length:")) != orxNULL))
+					{
+						// Updates result
+						orxString_ToS64(pc + 15, &s64Result, orxNULL);
+
+						// Valid?
+						if (s64Result > 0)
+						{
+							// Asked for actual content?
+							if (_pu8Buffer != orxNULL)
+							{
+								orxS32 s32Offset = 0;
+
+								// Did content start?
+								if (s32ContentStartLength != 0)
+								{
+									// Copies it
+									orxMemory_Copy(_pu8Buffer, pcContentStart, s32ContentStartLength);
+									s32Offset = (orxU32)s32ContentStartLength;
+								}
+
+								while ((int)s64Result - s32Offset > 0)
+								{
+									// Retrieves some content
+									s32Length = recv(stSocket, (char*)_pu8Buffer + s32Offset, (int)s64Result - s32Offset, 0);
+
+									// Success?
+									if (s32Length > 0)
+									{
+										// Updates offset
+										s32Offset += s32Length;
+									}
+									else
+									{
+										// Updates result
+										s64Result = 0;
+
+										// Asks for connection close
+										bClose = orxTRUE;
+										break;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			else
+			{
+				// Asks for connection close
+				bClose = orxTRUE;
+			}
+		}
+		else
+		{
+			// Asks for connection close
+			bClose = orxTRUE;
+		}
+
+		// Should close connection?
+		if (bClose != orxFALSE)
+		{
+			// Closes socket
+			close(stSocket);
+
+			// Removes it from table
+			orxHashTable_Remove(spstTable, orxRemote_GetHash(_zHost, _u32Port));
+		}
+	}
+
+	// Signals semaphore
+	orxThread_SignalSemaphore(spstSemaphore);
+
+	// Done!
+	return s64Result;
+}
+
 // Locate function, returns NULL if it can't handle the storage or if the resource can't be found in this storage
 static const orxSTRING orxFASTCALL orxRemote_WebLocate(const orxSTRING _zStorage, const orxSTRING _zResource, orxBOOL _bRequireExistence)
 {
@@ -441,8 +582,8 @@ static orxHANDLE orxFASTCALL orxRemote_WebOpen(const orxSTRING _zLocation, orxBO
     // Parses storage to extract host & port
     orxRemote_ParseURL(_zLocation, acHost, sizeof(acHost), &u32Port, &zResource);
 
-    // Retrieves resource
-    s64Size = orxRemote_ExecuteQuery(acHost, u32Port, zResource, orxREMOTE_QUERY_TYPE_CONTENT, &pu8Buffer);
+    // Retrieves resource size
+    s64Size = orxRemote_ExecuteQuery(acHost, u32Port, zResource, orxREMOTE_QUERY_TYPE_CONTENT, orxNULL);
 
     // Valid?
     if(s64Size > 0)
@@ -458,8 +599,10 @@ static orxHANDLE orxFASTCALL orxRemote_WebOpen(const orxSTRING _zLocation, orxBO
         // Stores its size
         pstWebArchive->s64Size = s64Size;
 
-        // Stores content
-        pstWebArchive->pu8Buffer = pu8Buffer;
+        // Stores location for use in WebRead
+        orxU32 nb = orxString_GetLength(_zLocation) + 1;
+        pstWebArchive->zLocation = (orxSTRING)orxMemory_Allocate(nb, orxMEMORY_TYPE_MAIN);
+        orxMemory_Copy(pstWebArchive->zLocation, _zLocation, nb);
 
         // Inits read cursor
         pstWebArchive->s64Cursor = 0;
@@ -483,7 +626,8 @@ static void orxFASTCALL orxRemote_WebClose(orxHANDLE _hResource)
   pstWebArchive = (WebArchive *)_hResource;
 
   // Frees its internal buffer
-  orxMemory_Free(pstWebArchive->pu8Buffer);
+  if (pstWebArchive->zLocation != orxNULL)
+    orxMemory_Free(pstWebArchive->zLocation);
 
   // Frees it
   orxMemory_Free(pstWebArchive);
@@ -570,6 +714,9 @@ static orxS64 orxFASTCALL orxRemote_WebRead(orxHANDLE _hResource, orxS64 _s64Siz
 {
   WebArchive *pstWebArchive;
   orxS64      s64CopySize, s64Result = 0;
+  orxU32          u32Port;
+  const orxSTRING zResource;
+  orxCHAR         acHost[256] = { 0 };
 
   // Gets archive wrapper
   pstWebArchive = (WebArchive *)_hResource;
@@ -577,8 +724,14 @@ static orxS64 orxFASTCALL orxRemote_WebRead(orxHANDLE _hResource, orxS64 _s64Siz
   // Gets actual copy size to prevent any out-of-bound access
   s64CopySize = orxMIN(_s64Size, pstWebArchive->s64Size - pstWebArchive->s64Cursor);
 
-  // Copies content
-  orxMemory_Copy(_pu8Buffer, pstWebArchive->pu8Buffer + pstWebArchive->s64Cursor, (orxS32)s64CopySize);
+  if (s64CopySize > 0)
+  {
+    // Parses storage to extract host & port
+    orxRemote_ParseURL(pstWebArchive->zLocation, acHost, sizeof(acHost), &u32Port, &zResource);
+
+    // Read the range directly into caller's buffer
+    orxRemote_ExecuteRange(acHost, u32Port, zResource, pstWebArchive->s64Cursor, s64CopySize, _pu8Buffer);
+  }
 
   // Updates cursor
   pstWebArchive->s64Cursor += s64CopySize;
